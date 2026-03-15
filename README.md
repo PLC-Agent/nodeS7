@@ -9,6 +9,25 @@ WARNING
 =======
 Fully test everything you do.  In situations where writing to a random area of memory within the PLC could cost you money, back up your data and test this really well.  If this could injure someone or worse, consider other software.
 
+Security
+=======
+
+**Important:** The S7comm protocol used by this library is inherently insecure. It was designed for isolated industrial networks and provides no built-in encryption or authentication. Be aware of the following:
+
+* **Network Isolation**: Always use this library on isolated industrial networks or behind firewalls. Never expose S7 communication (port 102) to untrusted networks or the internet.
+* **TLS Support (v0.4.0+)**: Optional TLS encryption is available for S7-1500 (FW 2.0+) and S7-1200 (FW 4.3+). Enable with `{ tls: true }` in connection parameters.
+* **GET/PUT Access**: Enabling GET/PUT on S7-1200/1500 opens the controller to all applications on the network, not just this library.
+* **Known CVEs**: Multiple vulnerabilities affect the S7 protocol ecosystem:
+  * CVE-2022-38465 (CVSS 9.3) - Private key extraction in S7-1200/1500
+  * CVE-2022-38773 - Firmware decryption vulnerabilities in S7-1500
+  * CVE-2021-37205 / CVE-2021-37185 - DoS via crafted packets on port 102
+* **Recommendations**:
+  * Use VPN or network segmentation to protect PLC traffic
+  * Keep PLC firmware updated to the latest version
+  * Consider using TLS connections where supported
+  * Monitor network traffic for unauthorized access to port 102
+  * For new installations, consider OPC UA as a more secure alternative
+
 Installation
 =======
 Using npm:
@@ -109,6 +128,27 @@ API
  - [writeItems()](#write-items)
  - [readAllItems()](#read-all-items)
 
+### Promise/Async API (v0.4.0+)
+ - `initiateConnectionAsync(options)` - Returns `Promise<void>`
+ - `readAllItemsAsync()` - Returns `Promise<Record<string, any>>`
+ - `writeItemsAsync(items, values)` - Returns `Promise<void>`
+ - `dropConnectionAsync()` - Returns `Promise<void>`
+
+### Events (v0.4.0+)
+NodeS7 extends EventEmitter and emits the following events:
+ - `'connecting'` - Connection attempt started
+ - `'connected'` - Successfully connected and ready
+ - `'disconnected'` - Connection lost or closed
+ - `'reconnecting'` - Reconnection attempt (emits `{ attempt, delay }`)
+ - `'connect-failed'` - Max reconnection attempts exhausted (emits `{ attempts }`)
+ - `'error'` - Connection error occurred
+
+### Error Codes (v0.4.0+)
+Access via `NodeS7.errors`:
+ - `ERR_S7_TIMEOUT`, `ERR_S7_INVALID_ADDRESS`, `ERR_S7_BUFFER_OVERFLOW`
+ - `ERR_S7_PACKET_MALFORMED`, `ERR_S7_CONNECTION_REFUSED`, `ERR_S7_NOT_CONNECTED`
+ - `ERR_S7_WRITE_IN_PROGRESS`, `ERR_S7_PLC_ERROR`, `ERR_S7_INVALID_ARGUMENT`
+
 
 ## <a name="initiate-connection"></a>nodes7.initiateConnection(options, callback)
 #### Description
@@ -118,15 +158,20 @@ Connects to a PLC.
 
 `Options`
 
-|Property|type|default|
-| --- | --- | --- |
-| rack       | number   | 0             |
-| slot       | number   | 2             |
-| port       | number   | 102           |
-| host       | string   | 192.168.8.106 |
-| timeout    | number   | 5000          |
-| localTSAP  | hex      | undefined     |
-| remoteTSAP | hex      | undefined     |
+|Property|type|default|description|
+| --- | --- | --- | --- |
+| rack       | number   | 0             | PLC rack number |
+| slot       | number   | 2             | PLC slot (2 for S7-300/400, 1 for 1200/1500) |
+| port       | number   | 102           | TCP port |
+| host       | string   | 192.168.8.106 | PLC IP address |
+| timeout    | number   | 5000          | TCP connection timeout (ms) |
+| localTSAP  | hex      | undefined     | Local TSAP for direct TSAP mode |
+| remoteTSAP | hex      | undefined     | Remote TSAP for direct TSAP mode |
+| tls        | boolean  | false         | Enable TLS encryption (S7-1500 FW 2.0+) |
+| tlsOptions | object   | undefined     | Options passed to tls.connect() (ca, cert, key, rejectUnauthorized) |
+| maxReconnectAttempts | number | Infinity | Maximum reconnection attempts |
+| reconnectDelay | number | 2000       | Base reconnection delay (ms) |
+| maxReconnectDelay | number | 30000   | Maximum reconnection delay for exponential backoff (ms) |
 
 `callback(err)`
 <dl>

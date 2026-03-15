@@ -1,3 +1,37 @@
+Version: 0.4.0
+------------
+### Security Hardening
+- Add input validation for all user-provided addresses in stringToS7Addr (DB number, offset, array length, bit offset)
+- Add safeParseInt helper to prevent NaN/out-of-range values from silently becoming 0
+- Add buffer bounds checking to prevent overflow in read/write operations
+- Fix TPKT/S7 packet length validation in checkRFCData (minimum length, TPKT range validation)
+- Fix logic bug in checkRFCData: changed && to || for RFC version/TPDU code check
+- Complete S7 header validation in onResponse (replaces TODO at former line 1196)
+- Decompose monolithic validation condition into labeled individual checks with clear error messages
+- Add bounds checking in sendWritePacket to prevent data buffer overflow
+- Add reportedDataLength validation in processS7Packet
+- Add buffer size limit check during read optimization (prepareReadPacket)
+- Add string type validation and buffer bounds checking in bufferizeS7Item
+- Add security section to README with CVE references and best practices
+
+### Connection Hardening
+- Add configurable exponential backoff for reconnection (reconnectDelay, maxReconnectDelay options)
+- Add maximum reconnection attempts limit (maxReconnectAttempts option)
+- Track reconnect count, reset on successful connection
+
+### New Features
+- Add EventEmitter inheritance - emit 'connecting', 'connected', 'disconnected', 'reconnecting', 'connect-failed', 'error' events
+- Add optional TLS support for S7-1500 (FW 2.0+) and S7-1200 (FW 4.3+) via { tls: true } option
+- Add Promise/async-await API: initiateConnectionAsync, readAllItemsAsync, writeItemsAsync, dropConnectionAsync
+- Add structured error codes (NodeS7.errors) for programmatic error handling
+
+### Modernization
+- Update Node.js engine requirement from "node 10.x.x" to ">=14.0.0"
+- Add TypeScript type definitions (nodeS7.d.ts)
+- Add test suite using Node.js built-in test runner (59 tests covering address parsing, packet validation, buffer helpers)
+- Update package.json with proper engines field, types, scripts, files, and expanded keywords
+- Export internal functions for testing when NODE_ENV=test
+
 Version: 0.3.18
 ------------
 - Add support for WDT to specify date/time which can be either UTC or local time depending on a connection parameter

@@ -33,15 +33,45 @@
 
 var net = require("net");
 var util = require("util");
+var EventEmitter = require("events");
 var effectiveDebugLevel = 0; // intentionally global, shared between connections
 var silentMode = false;
 
 module.exports = NodeS7;
 
+// Error code constants for structured error handling
+var S7Error = {
+	TIMEOUT: 'ERR_S7_TIMEOUT',
+	INVALID_ADDRESS: 'ERR_S7_INVALID_ADDRESS',
+	BUFFER_OVERFLOW: 'ERR_S7_BUFFER_OVERFLOW',
+	PACKET_MALFORMED: 'ERR_S7_PACKET_MALFORMED',
+	CONNECTION_REFUSED: 'ERR_S7_CONNECTION_REFUSED',
+	NOT_CONNECTED: 'ERR_S7_NOT_CONNECTED',
+	WRITE_IN_PROGRESS: 'ERR_S7_WRITE_IN_PROGRESS',
+	PLC_ERROR: 'ERR_S7_PLC_ERROR',
+	INVALID_ARGUMENT: 'ERR_S7_INVALID_ARGUMENT'
+};
+
+NodeS7.errors = S7Error;
+
+// Maximum allowed byte length for a single S7 item request
+var MAX_BYTE_LENGTH = 8192;
+
+// Input validation helper - returns undefined if value is NaN or out of range
+function safeParseInt(str, min, max) {
+	var val = parseInt(str, 10);
+	if (isNaN(val) || val < min || val > max) {
+		return undefined;
+	}
+	return val;
+}
+
 function NodeS7(opts) {
 	opts = opts || {};
 	silentMode = opts.silent || false;
 	effectiveDebugLevel = opts.debug ? 99 : 0
+
+	EventEmitter.call(this);
 
 	var self = this;
 
@@ -93,7 +123,15 @@ function NodeS7(opts) {
 	self.dropConnectionTimer = null;
 	self.reconnectTimer = undefined;
 	self.rereadTimer = undefined;
+
+	// Connection hardening properties
+	self.reconnectCount = 0;
+	self.maxReconnectAttempts = Infinity;
+	self.baseReconnectDelay = 2000;
+	self.maxReconnectDelay = 30000;
 }
+
+util.inherits(NodeS7, EventEmitter);
 
 NodeS7.prototype.getNextSeqNum = function() {
 	var self = this;
@@ -142,9 +180,19 @@ NodeS7.prototype.initiateConnection = function(cParam, callback) {
 	if (typeof (cParam.timeout) !== 'undefined') { // Added in 0.3.17 to ensure packets don't timeout at 1500ms if the user has specified a timeout externally.
 		self.globalTimeout = cParam.timeout;
 	}
+	if (typeof (cParam.maxReconnectAttempts) !== 'undefined') {
+		self.maxReconnectAttempts = cParam.maxReconnectAttempts;
+	}
+	if (typeof (cParam.reconnectDelay) !== 'undefined') {
+		self.baseReconnectDelay = cParam.reconnectDelay;
+	}
+	if (typeof (cParam.maxReconnectDelay) !== 'undefined') {
+		self.maxReconnectDelay = cParam.maxReconnectDelay;
+	}
 	self.connectionParams = cParam;
 	self.connectCallback = callback;
 	self.connectCBIssued = false;
+	self.reconnectCount = 0;
 	self.connectNow(self.connectionParams, false);
 }
 
@@ -195,19 +243,38 @@ NodeS7.prototype.connectNow = function(cParam) {
 	if (self.isoConnectionState >= 1) { return; }
 	self.connectionCleanup();
 
-        self.isoclient = net.connect(cParam);                                                                                                                                        
+	// Support optional TLS connections (S7-1500 FW 2.0+, S7-1200 FW 4.3+)
+	if (cParam.tls) {
+		var tls = require('tls');
+		var tlsOpts = Object.assign({}, cParam, {
+			minVersion: 'TLSv1.2',
+			rejectUnauthorized: cParam.tlsOptions && cParam.tlsOptions.rejectUnauthorized !== undefined ? cParam.tlsOptions.rejectUnauthorized : true
+		}, cParam.tlsOptions || {});
+		self.isoclient = tls.connect(tlsOpts);
+	} else {
+		self.isoclient = net.connect(cParam);
+	}
 
-        self.isoclient.setTimeout(cParam.timeout || 5000, () => {                                                                                                                    
-            self.isoclient.destroy();                                                                                                                                            
-            self.connectError.apply(self, [{ code: 'EUSERTIMEOUT' }]); // Former use of "arguments" was always going to be 0.  Use "USERTIMEOUT" to show difference between this and TCP timeout.                                                                                                                            
-        });                                                                                                                                                                          
+        self.isoclient.setTimeout(cParam.timeout || 5000, () => {
+            self.isoclient.destroy();
+            self.connectError.apply(self, [{ code: 'EUSERTIMEOUT' }]);
+        });
 
-        self.isoclient.once('connect', () => {                                                                                                                                       
-            self.isoclient.setTimeout(0);                                                                                                                                                
-            self.onTCPConnect.apply(self, arguments);                                                                                                                            
-        });                                                                                                                                                                          
+        self.isoclient.once('connect', () => {
+            self.isoclient.setTimeout(0);
+            self.onTCPConnect.apply(self, arguments);
+        });
 
-        self.isoConnectionState = 1;  // 1 = trying to connect  
+	// TLS sockets emit 'secureConnect' instead of 'connect'
+	if (cParam.tls) {
+		self.isoclient.once('secureConnect', () => {
+			self.isoclient.setTimeout(0);
+			self.onTCPConnect.apply(self, arguments);
+		});
+	}
+
+        self.isoConnectionState = 1;  // 1 = trying to connect
+	self.emit('connecting');
 
 	self.isoclient.on('error', function() {
             self.connectError.apply(self, arguments);
@@ -227,6 +294,7 @@ NodeS7.prototype.connectError = function(e) {
 		self.connectCallback(e);
 	}
 	self.isoConnectionState = 0;
+	self.emit('error', e);
 }
 
 NodeS7.prototype.readWriteError = function(e) {
@@ -236,33 +304,60 @@ NodeS7.prototype.readWriteError = function(e) {
 	self.connectionReset();
 }
 
+NodeS7.prototype.getReconnectDelay = function() {
+	var self = this;
+	var delay = Math.min(self.baseReconnectDelay * Math.pow(2, self.reconnectCount), self.maxReconnectDelay);
+	// Add jitter (up to 10% of delay)
+	delay += Math.floor(Math.random() * delay * 0.1);
+	return delay;
+}
+
 NodeS7.prototype.packetTimeout = function(packetType, packetSeqNum) {
 	var self = this;
 	outputLog('PacketTimeout called with type ' + packetType + ' and seq ' + packetSeqNum, 1, self.connectionID);
 	if (packetType === "connect") {
 		outputLog("TIMED OUT connecting to the PLC - Disconnecting", 0, self.connectionID);
-		outputLog("Wait for 2 seconds then try again.", 0, self.connectionID);
 		self.connectionReset();
-		outputLog("Scheduling a reconnect from packetTimeout, connect type", 0, self.connectionID);
+
+		// Check max reconnect attempts
+		if (self.reconnectCount >= self.maxReconnectAttempts) {
+			outputLog("Max reconnect attempts (" + self.maxReconnectAttempts + ") reached. Giving up.", 0, self.connectionID);
+			self.emit('connect-failed', { attempts: self.reconnectCount });
+			return undefined;
+		}
+
+		var reconnectDelay = self.getReconnectDelay();
+		self.reconnectCount++;
+		outputLog("Scheduling reconnect attempt " + self.reconnectCount + " in " + reconnectDelay + "ms", 0, self.connectionID);
+		self.emit('reconnecting', { attempt: self.reconnectCount, delay: reconnectDelay });
 		clearTimeout(self.reconnectTimer);
 		self.reconnectTimer = setTimeout(function() {
 			outputLog("The scheduled reconnect from packetTimeout, connect type, is happening now", 0, self.connectionID);
 			if (self.isoConnectionState === 0) {
 				self.connectNow.apply(self, arguments);
 			}
-		}, 2000, self.connectionParams);
+		}, reconnectDelay, self.connectionParams);
 		return undefined;
 	}
 	if (packetType === "PDU") {
-		outputLog("TIMED OUT waiting for PDU reply packet from PLC - Disconnecting");
-		outputLog("Wait for 2 seconds then try again.", 0, self.connectionID);
+		outputLog("TIMED OUT waiting for PDU reply packet from PLC - Disconnecting", 0, self.connectionID);
 		self.connectionReset();
-		outputLog("Scheduling a reconnect from packetTimeout, connect type", 0, self.connectionID);
+
+		if (self.reconnectCount >= self.maxReconnectAttempts) {
+			outputLog("Max reconnect attempts (" + self.maxReconnectAttempts + ") reached. Giving up.", 0, self.connectionID);
+			self.emit('connect-failed', { attempts: self.reconnectCount });
+			return undefined;
+		}
+
+		var reconnectDelay = self.getReconnectDelay();
+		self.reconnectCount++;
+		outputLog("Scheduling reconnect attempt " + self.reconnectCount + " in " + reconnectDelay + "ms", 0, self.connectionID);
+		self.emit('reconnecting', { attempt: self.reconnectCount, delay: reconnectDelay });
 		clearTimeout(self.reconnectTimer);
 		self.reconnectTimer = setTimeout(function() {
 			outputLog("The scheduled reconnect from packetTimeout, PDU type, is happening now", 0, self.connectionID);
 			self.connectNow.apply(self, arguments);
-		}, 2000, self.connectionParams);
+		}, reconnectDelay, self.connectionParams);
 		return undefined;
 	}
 	if (packetType === "read") {
@@ -427,6 +522,10 @@ NodeS7.prototype.onPDUReply = function(theData) {
 			self.readWriteError.apply(self, arguments);
 		});  // Might want to remove the self.connecterror listener
 		//self.isoclient.removeAllListeners('error');
+		// Reset reconnect count on successful connection
+		self.reconnectCount = 0;
+		self.emit('connected');
+
 		if ((!self.connectCBIssued) && (typeof (self.connectCallback) === "function")) {
 			self.connectCBIssued = true;
 			self.connectCallback();
@@ -847,6 +946,7 @@ NodeS7.prototype.prepareReadPacket = function() {
 			(itemList[i].dbNumber !== self.globalReadBlockList[thisBlock].dbNumber) ||			// Can't optimize across DBs
 			(!self.isOptimizableArea(itemList[i].areaS7Code)) || 					// Can't optimize T,C (I don't think) and definitely not P.
 			((itemList[i].offset - self.globalReadBlockList[thisBlock].offset + itemList[i].byteLength) > maxByteRequest) ||      	// If this request puts us over our max byte length, create a new block for consistency reasons.
+			((itemList[i].offset - self.globalReadBlockList[thisBlock].offset + itemList[i].byteLength) > MAX_BYTE_LENGTH) ||      	// Buffer bounds: prevent merged block from exceeding buffer size.
 			(itemList[i].offset - (self.globalReadBlockList[thisBlock].offset + self.globalReadBlockList[thisBlock].byteLength) > self.maxGap)) {		// If our gap is large, create a new block.
 
 			outputLog("Skipping optimization of item " + itemList[i].addr, 0, self.connectionID);
@@ -1068,6 +1168,11 @@ NodeS7.prototype.sendWritePacket = function() {
 		for (var j = 0; j < self.writePacketArray[i].itemList.length; j++) {
 			S7AddrToBuffer(self.writePacketArray[i].itemList[j], true).copy(self.writeReq, 19 + j * 12);
 			itemBuffer = getWriteBuffer(self.writePacketArray[i].itemList[j]);
+			// Buffer bounds check to prevent overflow
+			if (dataBufferPointer + itemBuffer.length > 8192) {
+				outputLog('Write buffer overflow prevented - data exceeds 8192 bytes at item ' + j, 0, self.connectionID);
+				break;
+			}
 			itemBuffer.copy(dataBuffer, dataBufferPointer);
 			dataBufferPointer += itemBuffer.length;
 			// NOTE: It seems that when writing, the data that is sent must have a "fill byte" so that data length is even only for all
@@ -1192,29 +1297,72 @@ NodeS7.prototype.onResponse = function(theData) {
 		});
 	}else if( data[7] === 0x32 ){//check the validy of FA+S7 package
 
-		//*********************   VALIDY CHECK ***********************************
-		//TODO: Check S7-Header properly
-		if (data.length > 8 && data[8] != 3) {
-			outputLog('PDU type (byte 8) was returned as ' + data[8] + ' where the response PDU of 3 was expected.');
+		//*********************   VALIDITY CHECK ***********************************
+		// S7 Header validation (replaces former TODO)
+
+		// Validate minimum length for S7 header (17 bytes: 4 TPKT + 3 COTP + 10 S7 header minimum)
+		if (data.length < 17) {
+			outputLog('S7 packet too short for header validation: ' + data.length + ' bytes');
+			self.connectionReset();
+			return null;
+		}
+
+		// Validate S7 protocol ID (byte 7 must be 0x32)
+		if (data[7] !== 0x32) {
+			outputLog('Invalid S7 protocol ID: 0x' + data[7].toString(16) + ' (expected 0x32)');
+			self.connectionReset();
+			return null;
+		}
+
+		// Validate PDU type (byte 8): 1=request, 2=ack, 3=ack-data, 7=userdata
+		var pduType = data[8];
+		if (pduType !== 1 && pduType !== 2 && pduType !== 3 && pduType !== 7) {
+			outputLog('Invalid S7 PDU type: ' + pduType + ' (expected 1, 2, 3, or 7)');
+			outputLog(data);
+			self.connectionReset();
+			return null;
+		}
+
+		// For read/write responses we expect ack-data (type 3)
+		if (pduType !== 3) {
+			outputLog('PDU type (byte 8) was returned as ' + pduType + ' where the response PDU of 3 was expected.');
 			outputLog('Maybe you are requesting more than 240 bytes of data in a packet?');
 			outputLog(data);
 			self.connectionReset();
 			return null;
 		}
-		// The smallest read packet will pass a length check of 25.  For a 1-item write response with no data, length will be 22.
-		if (data.length > data.readInt16BE(2)) {
-			outputLog("An oversize packet was detected.  Excess length is " + (data.length - data.readInt16BE(2)) + ".  ");
+
+		// Check for oversize packet (two packets concatenated)
+		var tpktLength = data.readInt16BE(2);
+		if (data.length > tpktLength) {
+			outputLog("An oversize packet was detected.  Excess length is " + (data.length - tpktLength) + ".  ");
 			outputLog("We assume this is because two packets were sent at nearly the same time by the PLC.");
 			outputLog("We are slicing the buffer and scheduling the second half for further processing next loop.");
 			setTimeout(function() {
 				self.onResponse.apply(self, arguments);
-			}, 0, data.slice(data.readInt16BE(2)));  // This re-triggers this same function with the sliced-up buffer.
-			// was used as a test		setTimeout(process.exit, 2000);
+			}, 0, data.slice(tpktLength));
 		}
 
-		if (data.length < data.readInt16BE(2) || data.readInt16BE(2) < 22 || data[5] !== 0xf0 || data[4] + 1 + 12 + 4 + data.readInt16BE(13) + data.readInt16BE(15) !== data.readInt16BE(2) || !(data[6] >> 7) || (data[7] !== 0x32) || (data[8] !== 3)) {
+		// Validate COTP data indicator
+		var cotpValid = data[5] === 0xf0;
+		// Validate last data unit flag
+		var lastDataUnitValid = !!(data[6] >> 7);
+		// Validate parameter length and data length consistency
+		var cotpLength = data[4];
+		var paramLength = data.readInt16BE(13);
+		var dataLength = data.readInt16BE(15);
+		var expectedTpktLength = cotpLength + 1 + 12 + 4 + paramLength + dataLength;
+		var lengthConsistent = expectedTpktLength === tpktLength;
+
+		// Validate received data is at least as long as TPKT declares
+		var bufferSufficient = data.length >= tpktLength;
+		// Validate minimum TPKT length for a valid S7 response
+		var tpktMinValid = tpktLength >= 22;
+
+		if (!bufferSufficient || !tpktMinValid || !cotpValid || !lengthConsistent || !lastDataUnitValid) {
 			outputLog('INVALID READ RESPONSE - DISCONNECTING');
-			outputLog('TPKT Length From Header is ' + data.readInt16BE(2) + ' and RCV buffer length is ' + data.length + ' and COTP length is ' + data.readUInt8(4) + ' and data[6] is ' + data[6]);
+			outputLog('Validation details: bufferOK=' + bufferSufficient + ' tpktMinOK=' + tpktMinValid + ' cotpOK=' + cotpValid + ' lengthOK=' + lengthConsistent + ' lastUnitOK=' + lastDataUnitValid);
+			outputLog('TPKT Length=' + tpktLength + ' RCV length=' + data.length + ' COTP length=' + cotpLength + ' paramLength=' + paramLength + ' dataLength=' + dataLength);
 			outputLog(data);
 			self.connectionReset();
 			return null;
@@ -1538,8 +1686,12 @@ NodeS7.prototype.resetNow = function() {
 
 NodeS7.prototype.connectionCleanup = function() {
 	var self = this;
+	var wasConnected = self.isoConnectionState >= 4;
 	self.isoConnectionState = 0;
 	outputLog('Connection cleanup is happening', 0, self.connectionID);
+	if (wasConnected) {
+		self.emit('disconnected');
+	}
 	if (typeof (self.isoclient) !== "undefined") {
 		// destroy the socket connection
 		self.isoclient.destroy();
@@ -1564,12 +1716,26 @@ NodeS7.prototype.connectionCleanup = function() {
 
 function checkRFCData(data){
    var ret=null;
+
+   // Validate minimum buffer length before accessing fields
+   if (!Buffer.isBuffer(data) || data.length < 7) {
+      outputLog('checkRFCData: Packet too short (' + (data ? data.length : 0) + ' bytes, minimum 7)');
+      return 'error';
+   }
+
    var RFC_Version = data[0];
    var TPKT_Length = data.readInt16BE(2);
    var TPDU_Code = data[5]; //Data==0xF0 !!
    var LastDataUnit = data[6];//empty fragmented frame => 0=not the last package; 1=last package
 
-   if(RFC_Version !==0x03 && TPDU_Code !== 0xf0){
+   // Validate TPKT length range
+   if (TPKT_Length < 7 || TPKT_Length > 65535) {
+      outputLog('checkRFCData: Invalid TPKT length: ' + TPKT_Length);
+      return 'error';
+   }
+
+   // Fix: Use OR (||) instead of AND (&&) - either condition being wrong should be an error
+   if(RFC_Version !==0x03 || TPDU_Code !== 0xf0){
       //Check if its an RFC package and a Data package
       return 'error';
    }else if((LastDataUnit >> 7) === 0 && TPKT_Length == data.length &&  data.length === 7){
@@ -1666,6 +1832,15 @@ function processS7Packet(theData, theItem, thePointer, theCID) {
 	} else {
 		reportedDataLength = theData.readUInt16BE(thePointer + 2);
 	}
+
+	// Validate reported data length is non-negative and within bounds
+	if (reportedDataLength < 0 || reportedDataLength > MAX_BYTE_LENGTH) {
+		theItem.valid = false;
+		theItem.errCode = 'Reported data length out of bounds: ' + reportedDataLength;
+		outputLog(theItem.errCode, 0, theCID);
+		return 0;
+	}
+
 	var responseCode = theData[thePointer];
 	var transportCode = theData[thePointer + 1];
 
@@ -2198,6 +2373,16 @@ function bufferizeS7Item(theItem) {
 					break;
 				case "S":
 				case "STRING":
+					// Validate write value is a string
+					if (typeof theItem.writeValue[arrayIndex] !== 'string') {
+						outputLog("Warning - Non-string value provided for STRING write, converting to string");
+						theItem.writeValue[arrayIndex] = String(theItem.writeValue[arrayIndex]);
+					}
+					// Bounds check for write pointer
+					if (thePointer + theItem.dtypelen > theItem.writeBuffer.length) {
+						outputLog("Error - String write would exceed buffer bounds");
+						return 0;
+					}
 					// Convert to bytes.
 					theItem.writeBuffer.writeUInt8(theItem.dtypelen - 2, thePointer); // Array length is requested val, -2 is string length
 					theItem.writeBuffer.writeUInt8(Math.min(theItem.dtypelen - 2, theItem.writeValue[arrayIndex].length), thePointer+1); // Array length is requested val, -2 is string length
@@ -2287,6 +2472,16 @@ function bufferizeS7Item(theItem) {
 				break;
 			case "S":
 			case "STRING":
+				// Validate write value is a string
+				if (typeof theItem.writeValue !== 'string') {
+					outputLog("Warning - Non-string value provided for STRING write, converting to string");
+					theItem.writeValue = String(theItem.writeValue);
+				}
+				// Bounds check for write pointer
+				if (thePointer + theItem.dtypelen > theItem.writeBuffer.length) {
+					outputLog("Error - String write would exceed buffer bounds");
+					return 0;
+				}
 				// Convert to bytes.
 				theItem.writeBuffer.writeUInt8(theItem.dtypelen - 2, thePointer); // Array length is requested val, -2 is string length
 				theItem.writeBuffer.writeUInt8(Math.min(theItem.dtypelen - 2, theItem.writeValue.length), thePointer+1); // Array length is requested val, -2 is string length
@@ -2318,6 +2513,12 @@ function stringToS7Addr(addr, useraddr, cParam) {
 
 	if (useraddr === '_COMMERR') { return undefined; } // Special-case for communication error status - this variable returns true when there is a communications error
 
+	// Validate input is a non-empty string
+	if (typeof addr !== 'string' || addr.length === 0) {
+		outputLog("Error - Invalid address: must be a non-empty string");
+		return undefined;
+	}
+
 	theItem = new S7Item();
 	splitString = addr.split(',');
 	if (splitString.length === 0 || splitString.length > 2) {
@@ -2330,15 +2531,37 @@ function stringToS7Addr(addr, useraddr, cParam) {
 		splitString2 = splitString[1].split('.');
 		theItem.datatype = splitString2[0].replace(/[0-9]/gi, '').toUpperCase(); // Clear the numbers
 		if (theItem.datatype === 'X' && splitString2.length === 3) {
-			theItem.arrayLength = parseInt(splitString2[2], 10);
+			theItem.arrayLength = safeParseInt(splitString2[2], 1, MAX_BYTE_LENGTH);
+			if (theItem.arrayLength === undefined) {
+				outputLog("Error - Invalid array length in address " + addr);
+				return undefined;
+			}
 		} else if ((theItem.datatype === 'S' || theItem.datatype === 'STRING') && splitString2.length === 3) {
-			theItem.dtypelen = parseInt(splitString2[1], 10) + 2; // With strings, add 2 to the length due to S7 header
-			theItem.arrayLength = parseInt(splitString2[2], 10);  // For strings, array length is now the number of strings
+			var strLen = safeParseInt(splitString2[1], 1, MAX_BYTE_LENGTH - 2);
+			if (strLen === undefined) {
+				outputLog("Error - Invalid string length in address " + addr);
+				return undefined;
+			}
+			theItem.dtypelen = strLen + 2; // With strings, add 2 to the length due to S7 header
+			theItem.arrayLength = safeParseInt(splitString2[2], 1, MAX_BYTE_LENGTH);
+			if (theItem.arrayLength === undefined) {
+				outputLog("Error - Invalid array length in address " + addr);
+				return undefined;
+			}
 		} else if ((theItem.datatype === 'S' || theItem.datatype === 'STRING') && splitString2.length === 2) {
-			theItem.dtypelen = parseInt(splitString2[1], 10) + 2; // With strings, add 2 to the length due to S7 header
+			var strLen2 = safeParseInt(splitString2[1], 1, MAX_BYTE_LENGTH - 2);
+			if (strLen2 === undefined) {
+				outputLog("Error - Invalid string length in address " + addr);
+				return undefined;
+			}
+			theItem.dtypelen = strLen2 + 2; // With strings, add 2 to the length due to S7 header
 			theItem.arrayLength = 1;
 		} else if (theItem.datatype !== 'X' && splitString2.length === 2) {
-			theItem.arrayLength = parseInt(splitString2[1], 10);
+			theItem.arrayLength = safeParseInt(splitString2[1], 1, MAX_BYTE_LENGTH);
+			if (theItem.arrayLength === undefined) {
+				outputLog("Error - Invalid array length in address " + addr);
+				return undefined;
+			}
 		} else {
 			theItem.arrayLength = 1;
 		}
@@ -2347,18 +2570,24 @@ function stringToS7Addr(addr, useraddr, cParam) {
 			return undefined;
 		}
 
-		// Get the data block number from the first part.
-		theItem.dbNumber = parseInt(splitString[0].replace(/[A-z]/gi, ''), 10);
+		// Get the data block number from the first part with validation.
+		theItem.dbNumber = safeParseInt(splitString[0].replace(/[A-z]/gi, ''), 1, 65535);
+		if (theItem.dbNumber === undefined) {
+			outputLog("Error - Invalid DB number in address " + addr);
+			return undefined;
+		}
 
 		// Get the data block byte offset from the second part, eliminating characters.
-		// Note that at this point, we may miss some info, like a "T" at the end indicating TIME data type or DATE data type or DT data type.  We ignore these.
-		// This is on the TODO list.
-		theItem.offset = parseInt(splitString2[0].replace(/[A-z]/gi, ''), 10);  // Get rid of characters
+		theItem.offset = safeParseInt(splitString2[0].replace(/[A-z]/gi, ''), 0, 65535);
+		if (theItem.offset === undefined) {
+			outputLog("Error - Invalid byte offset in address " + addr);
+			return undefined;
+		}
 
 		// Get the bit offset
 		if (splitString2.length > 1 && theItem.datatype === 'X') {
-			theItem.bitOffset = parseInt(splitString2[1], 10);
-			if (theItem.bitOffset > 7) {
+			theItem.bitOffset = safeParseInt(splitString2[1], 0, 7);
+			if (theItem.bitOffset === undefined) {
 				outputLog("Invalid bit offset specified for address " + addr);
 				return undefined;
 			}
@@ -2588,19 +2817,35 @@ function stringToS7Addr(addr, useraddr, cParam) {
 
 		theItem.bitOffset = 0;
 		if (splitString2.length > 1 && theItem.datatype === 'X') { // Bit and bit array
-			theItem.bitOffset = parseInt(splitString2[1].replace(/[A-z]/gi, ''), 10);
+			theItem.bitOffset = safeParseInt(splitString2[1].replace(/[A-z]/gi, ''), 0, 7);
+			if (theItem.bitOffset === undefined) {
+				outputLog("Error - Invalid bit offset in address " + addr);
+				return undefined;
+			}
 			if (splitString2.length > 2) {  // Bit array only
-				theItem.arrayLength = parseInt(splitString2[2].replace(/[A-z]/gi, ''), 10);
+				theItem.arrayLength = safeParseInt(splitString2[2].replace(/[A-z]/gi, ''), 1, MAX_BYTE_LENGTH);
+				if (theItem.arrayLength === undefined) {
+					outputLog("Error - Invalid array length in address " + addr);
+					return undefined;
+				}
 			} else {
 				theItem.arrayLength = 1;
 			}
-		} else if (splitString2.length > 1 && theItem.datatype !== 'X') { // Bit and bit array
-			theItem.arrayLength = parseInt(splitString2[1].replace(/[A-z]/gi, ''), 10);
+		} else if (splitString2.length > 1 && theItem.datatype !== 'X') { // Byte/word array
+			theItem.arrayLength = safeParseInt(splitString2[1].replace(/[A-z]/gi, ''), 1, MAX_BYTE_LENGTH);
+			if (theItem.arrayLength === undefined) {
+				outputLog("Error - Invalid array length in address " + addr);
+				return undefined;
+			}
 		} else {
 			theItem.arrayLength = 1;
 		}
 		theItem.dbNumber = 0;
-		theItem.offset = parseInt(splitString2[0].replace(/[A-z]/gi, ''), 10);
+		theItem.offset = safeParseInt(splitString2[0].replace(/[A-z]/gi, ''), 0, 65535);
+		if (theItem.offset === undefined) {
+			outputLog("Error - Invalid offset in address " + addr);
+			return undefined;
+		}
 	}
 
 	if (theItem.datatype === 'DI') {
@@ -2724,7 +2969,11 @@ function stringToS7Addr(addr, useraddr, cParam) {
 		theItem.byteLength = theItem.arrayLength * theItem.dtypelen;
 	}
 
-	//	outputLog(' Arr lenght is ' + theItem.arrayLength + ' and DTL is ' + theItem.dtypelen);
+	// Validate total byte length does not exceed buffer size
+	if (theItem.byteLength > MAX_BYTE_LENGTH) {
+		outputLog("Error - Requested data length (" + theItem.byteLength + " bytes) exceeds maximum (" + MAX_BYTE_LENGTH + ") for address " + addr);
+		return undefined;
+	}
 
 	theItem.byteLengthWithFill = theItem.byteLength;
 	if (theItem.byteLengthWithFill % 2) { theItem.byteLengthWithFill += 1; }  // S7 will add a filler byte.  Use this expected reply length for PDU calculations.
@@ -2884,4 +3133,53 @@ function outputLog(txt, debugLevel, id) {
 	if (typeof (debugLevel) === 'undefined' || effectiveDebugLevel >= debugLevel) {
 		console.log('[' + process.hrtime() + idtext + '] ' + util.format(txt));
 	}
+}
+
+// Promise/async-await API wrappers
+NodeS7.prototype.initiateConnectionAsync = function(params) {
+	var self = this;
+	return new Promise(function(resolve, reject) {
+		self.initiateConnection(params, function(err) {
+			if (err) { reject(err); } else { resolve(); }
+		});
+	});
+};
+
+NodeS7.prototype.readAllItemsAsync = function() {
+	var self = this;
+	return new Promise(function(resolve, reject) {
+		self.readAllItems(function(err, values) {
+			if (err) { reject(new Error('Read quality error')); } else { resolve(values); }
+		});
+	});
+};
+
+NodeS7.prototype.writeItemsAsync = function(items, values) {
+	var self = this;
+	return new Promise(function(resolve, reject) {
+		self.writeItems(items, values, function(err) {
+			if (err) { reject(new Error('Write quality error')); } else { resolve(); }
+		});
+	});
+};
+
+NodeS7.prototype.dropConnectionAsync = function() {
+	var self = this;
+	return new Promise(function(resolve) {
+		self.dropConnection(function() {
+			resolve();
+		});
+	});
+};
+
+// Export internal functions for testing when NODE_ENV=test
+if (process.env.NODE_ENV === 'test') {
+	module.exports._internal = {
+		stringToS7Addr: stringToS7Addr,
+		checkRFCData: checkRFCData,
+		S7AddrToBuffer: S7AddrToBuffer,
+		processS7Packet: processS7Packet,
+		safeParseInt: safeParseInt,
+		S7Error: S7Error
+	};
 }
